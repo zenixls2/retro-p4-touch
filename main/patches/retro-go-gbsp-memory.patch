@@ -1,0 +1,139 @@
+diff --git a/gbsp/components/gbsp-libretro/gba_memory.c b/gbsp/components/gbsp-libretro/gba_memory.c
+index eacec4c9..8a8689a7 100644
+--- a/gbsp/components/gbsp-libretro/gba_memory.c
++++ b/gbsp/components/gbsp-libretro/gba_memory.c
+@@ -337,10 +337,10 @@ const u32 def_seq_cycles[16][2] =
+ };
+ 
+ 
+-EXT_RAM_ATTR u8 bios_rom[1024 * 16];
++EXT_RAM_BSS_ATTR u8 bios_rom[1024 * 16];
+ 
+ // Up to 128kb, store SRAM, flash ROM, or EEPROM here.
+-EXT_RAM_ATTR u8 gamepak_backup[1024 * 128];
++EXT_RAM_BSS_ATTR u8 gamepak_backup[1024 * 128];
+ 
+ u32 dma_bus_val;
+ dma_transfer_type dma[4];
+@@ -375,6 +375,8 @@ u32 gamepak_sticky_bit[1024/32];
+ // pages from, so there's no slowdown with opening and closing the file
+ // a lot.
+ FILE *gamepak_file_large = NULL;
++static const u8 *gamepak_data_memory = NULL;
++static u32 gamepak_data_memory_size = 0;
+ 
+ // Writes to these respective locations should trigger an update
+ // so the related subsystem may react to it.
+@@ -2185,19 +2187,43 @@ static u32 evict_gamepak_page(void)
+ 
+ u8 *load_gamepak_page(u32 physical_index)
+ {
++  const u32 page_size = 32 * 1024;
++
+   if(physical_index >= (gamepak_size >> 15))
+     return &gamepak_buffers[0][0];
+ 
++  if ((gamepak_file_large == NULL) && (gamepak_data_memory == NULL))
++    return &gamepak_buffers[0][0];
++
+   u32 entry = evict_gamepak_page();
+   u32 block_idx = entry / 32;
+   u32 block_off = entry % 32;
+-  u8 *swap_location = &gamepak_buffers[block_idx][32 * 1024 * block_off];
++  u8 *swap_location = &gamepak_buffers[block_idx][page_size * block_off];
+ 
+   // Fill in the entry
+   gamepak_blk_queue[entry].phy_rom = physical_index;
+ 
+-  fseek(gamepak_file_large, physical_index * (32 * 1024), SEEK_SET);
+-  fread(swap_location, (32 * 1024), 1, gamepak_file_large);
++  if (gamepak_file_large)
++  {
++    fseek(gamepak_file_large, physical_index * page_size, SEEK_SET);
++    fread(swap_location, page_size, 1, gamepak_file_large);
++  }
++  else
++  {
++    u32 src_offset = physical_index * page_size;
++    if (src_offset < gamepak_data_memory_size)
++    {
++      u32 remaining = gamepak_data_memory_size - src_offset;
++      u32 copy_size = (remaining < page_size) ? remaining : page_size;
++      memcpy(swap_location, gamepak_data_memory + src_offset, copy_size);
++      if (copy_size < page_size)
++        memset(swap_location + copy_size, 0xFF, page_size - copy_size);
++    }
++    else
++    {
++      memset(swap_location, 0xFF, page_size);
++    }
++  }
+ 
+   // Map it to the read handlers now
+   map_rom_entry(read, physical_index, swap_location, gamepak_size >> 15);
+@@ -2500,6 +2526,46 @@ unsigned memory_write_savestate(u8 *dst)
+ static s32 load_gamepak_raw(const char *name)
+ {
+   unsigned i, j;
++  if (gamepak_data_memory && gamepak_data_memory_size)
++  {
++    u32 rom_blocks;
++    u32 buf_blocks;
++    u32 ldblks;
++
++    gamepak_size = (gamepak_data_memory_size + 0x7FFF) & ~0x7FFF;
++    rom_blocks = gamepak_size >> 15;
++    buf_blocks = (gamepak_size + gamepak_buffer_blocksize - 1) / gamepak_buffer_blocksize;
++    ldblks = (buf_blocks < gamepak_buffer_count) ? buf_blocks : gamepak_buffer_count;
++
++    if (ldblks == 0)
++      return -1;
++
++    map_null(read, 0x8000000, 0xD000000);
++
++    for (i = 0; i < ldblks; i++)
++    {
++      u32 src_offset = i * gamepak_buffer_blocksize;
++      u32 remaining = gamepak_data_memory_size - src_offset;
++      u32 copy_size = (remaining < gamepak_buffer_blocksize) ? remaining : gamepak_buffer_blocksize;
++
++      memcpy(gamepak_buffers[i], gamepak_data_memory + src_offset, copy_size);
++      if (copy_size < gamepak_buffer_blocksize)
++        memset(gamepak_buffers[i] + copy_size, 0xFF, gamepak_buffer_blocksize - copy_size);
++
++      for (j = 0; j < 32 && i * 32 + j < rom_blocks; j++)
++      {
++        u32 phyn = i * 32 + j;
++        u8 *blkptr = &gamepak_buffers[i][32 * 1024 * j];
++        u32 entry = evict_gamepak_page();
++        gamepak_blk_queue[entry].phy_rom = phyn;
++        map_rom_entry(read, phyn, blkptr, rom_blocks);
++      }
++    }
++
++    gamepak_file_large = NULL;
++    return 0;
++  }
++
+   gamepak_file_large = fopen(name, "rb");
+   if(gamepak_file_large)
+   {
+@@ -2540,6 +2606,12 @@ static s32 load_gamepak_raw(const char *name)
+   return -1;
+ }
+ 
++void set_gamepak_source_memory(const u8 *data, u32 size)
++{
++  gamepak_data_memory = data;
++  gamepak_data_memory_size = size;
++}
++
+ u32 load_gamepak(const struct retro_game_info* info, const char *name,
+                  int force_rtc, int force_rumble, int force_serial)
+ {
+@@ -2585,5 +2657,3 @@ s32 load_bios(char *name)
+   fclose(fd);
+   return 0;
+ }
+-
+-

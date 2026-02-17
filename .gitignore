@@ -1,0 +1,23 @@
+# ESP-IDF build output
+/build/
+/.cache/
+
+# Local SDK config (defaults are kept in sdkconfig.defaults)
+/sdkconfig
+/sdkconfig.old
+
+# Downloaded component manager sources
+/managed_components/
+
+# Local ROM/assets generated for testing
+/pokemon.gba
+/main/pokemon.gba.zlib
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
