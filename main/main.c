@@ -815,7 +815,7 @@ static esp_err_t gba_init_runtime(void)
     set_gamepak_source_memory(s_rom_buffer, (u32)s_rom_size);
     if (load_gamepak(NULL,
                      "embedded://pokemon.gba",
-                     FEAT_DISABLE,
+                     FEAT_ENABLE,
                      FEAT_DISABLE,
                      SERIAL_MODE_DISABLED) != 0) {
         ESP_LOGE(TAG, "load_gamepak failed");
