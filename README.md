@@ -1,4 +1,4 @@
-# ESP32P4 + ESP32C6 Retro-game application
+# ESP32P4 + ESP32C6 Retro-game application (Built using OpenAI GPT5.3-Codex and Oh-my-opencode)
 
 <img src="https://github.com/zenixls2/retro-p4-touch/blob/main/demo.gif" alt="demo" width="400"/>
 
