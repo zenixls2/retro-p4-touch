@@ -1,6 +1,6 @@
 # ESP32P4 + ESP32C6 Retro-game application
 
-<img src="https://github.com/zenixls2/retro-p4-touch/blob/main/demo.gif?raw=true" alt="demo" width="400"/>
+<img src="https://github.com/zenixls2/retro-p4-touch/blob/main/demo.gif" alt="demo" width="400"/>
 
 This is a retro-game application for ESP32P4 and ESP32C6 microcontrollers. It includes a simple game that can be played on a small display connected to the microcontroller. We make use of the `JC48804C_I_W` board from GUITON. The example and all the necessary files are included in `/Users/hanshenghuang/esp/JC4880P443C_I_W/` and the example project is located in `/Users/hanshenghuang/esp/JC4880P443C_I_W/1-Demo/idf_examples/ESP-IDF/xiaozhi-esp32`.
 
