@@ -144,9 +144,23 @@ idf_component_register(
         "${GPSP_DIR}/libretro/libretro-common/include"
     REQUIRES
         esp_driver_ppa
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_http_client
+        fatfs
+        sdmmc
+        bt
     EMBED_FILES
         "pokemon.gba.zlib"
         "open_gba_bios.bin"
+)
+
+idf_component_get_property(FATFS_COMPONENT_LIB fatfs COMPONENT_LIB)
+target_compile_options(${FATFS_COMPONENT_LIB} PRIVATE
+    -include
+    "${CMAKE_CURRENT_LIST_DIR}/fatfs_exfat_override.h"
 )
 
 set_source_files_properties(
