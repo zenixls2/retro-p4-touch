@@ -250,6 +250,7 @@ static bool s_ppa_debug_logged;
 
 static SemaphoreHandle_t s_wifi_lock;
 static SemaphoreHandle_t s_bt_lock;
+static SemaphoreHandle_t s_gba_runtime_lock;
 static bool s_wifi_ready;
 static bool s_wifi_connecting;
 static bool s_wifi_connected;
@@ -302,6 +303,9 @@ static void gba_prepare_scale_lut(void);
 static void gba_disable_scroll(lv_obj_t *obj);
 static void gba_set_status_text_locked(const char *text, lv_color_t color);
 static void gba_set_status_text_threadsafe(const char *text, lv_color_t color);
+static bool gba_runtime_lock_take(TickType_t timeout);
+static void gba_runtime_lock_give(void);
+static void gba_deinit_ppa_client(void);
 static void gba_request_start_loading(void);
 static void gba_close_wifi_popup_locked(void);
 static void gba_close_wifi_password_popup_locked(void);
@@ -513,6 +517,21 @@ static esp_err_t gba_init_ppa_client(void)
 
     s_ppa_srm_ready = true;
     return ESP_OK;
+}
+
+static void gba_deinit_ppa_client(void)
+{
+    if (s_ppa_srm_client != NULL) {
+        esp_err_t err = ppa_unregister_client(s_ppa_srm_client);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to unregister PPA client: %s", esp_err_to_name(err));
+        }
+    }
+
+    s_ppa_srm_client = NULL;
+    s_ppa_srm_ready = false;
+    s_ppa_srm_warned = false;
+    s_ppa_debug_logged = false;
 }
 
 static bool gba_scale_frame_with_ppa(void)
@@ -1424,7 +1443,13 @@ static void gba_loader_task(void *arg)
 {
     (void)arg;
 
-    s_gba_init_result = gba_init_runtime();
+    if (gba_runtime_lock_take(portMAX_DELAY)) {
+        s_gba_init_result = gba_init_runtime();
+        gba_runtime_lock_give();
+    } else {
+        s_gba_init_result = ESP_ERR_INVALID_STATE;
+    }
+
     if (s_gba_init_result == ESP_OK) {
         s_gba_running = true;
         gba_set_status_text_threadsafe("ROM loaded. Emulator running.", lv_color_hex(0x8FE39D));
@@ -1509,6 +1534,21 @@ static void gba_bt_lock_give(void)
 {
     if (s_bt_lock != NULL) {
         xSemaphoreGive(s_bt_lock);
+    }
+}
+
+static bool gba_runtime_lock_take(TickType_t timeout)
+{
+    if (s_gba_runtime_lock == NULL) {
+        return false;
+    }
+    return xSemaphoreTake(s_gba_runtime_lock, timeout) == pdTRUE;
+}
+
+static void gba_runtime_lock_give(void)
+{
+    if (s_gba_runtime_lock != NULL) {
+        xSemaphoreGive(s_gba_runtime_lock);
     }
 }
 
@@ -4052,6 +4092,45 @@ static void gba_power_off_game_locked(void)
     s_gba_frame_ready = false;
     s_frame_stream_status_deadline = 0;
 
+    if (gba_runtime_lock_take(portMAX_DELAY)) {
+        esp_err_t save_flush_err = gba_flush_backup_to_sd_card(false);
+        if ((save_flush_err != ESP_OK)
+            && (save_flush_err != ESP_ERR_NOT_FOUND)
+            && (save_flush_err != ESP_ERR_TIMEOUT)) {
+            ESP_LOGW(TAG, "Failed to flush save on power-off: %s", esp_err_to_name(save_flush_err));
+        }
+
+        if (s_gp_core_initialized) {
+            memory_term();
+            s_gp_core_initialized = false;
+        }
+
+        gba_deinit_ppa_client();
+
+        if (s_rom_buffer != NULL) {
+            heap_caps_free(s_rom_buffer);
+            s_rom_buffer = NULL;
+            s_rom_size = 0;
+        }
+
+        memset(gamepak_backup, 0xFF, sizeof(gamepak_backup));
+        if (s_gp_frame_buf != NULL) {
+            memset(s_gp_frame_buf, 0, GBA_SCREEN_BUFFER_SIZE);
+        }
+        if (s_game_canvas_buf != NULL) {
+            memset(s_game_canvas_buf, 0, GBA_CANVAS_BYTES);
+        }
+
+        s_backup_checksum = gba_backup_checksum32();
+        s_backup_observed_checksum = s_backup_checksum;
+        s_backup_flush_deadline = 0;
+        s_backup_poll_deadline = 0;
+        s_last_frame_counter = 0;
+        s_gba_init_result = ESP_ERR_INVALID_STATE;
+
+        gba_runtime_lock_give();
+    }
+
     if (s_game_canvas != NULL) {
         lv_canvas_fill_bg(s_game_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
         lv_obj_invalidate(s_game_canvas);
@@ -4384,47 +4463,50 @@ static void gba_emulation_task(void *arg)
 
     while (true) {
         if (s_gba_running && (s_gp_frame_buf != NULL) && (s_game_canvas != NULL) && (s_game_canvas_buf != NULL)) {
-            uint32_t frame_before = frame_counter;
             TickType_t now_tick = xTaskGetTickCount();
+            bool has_frame = false;
 
-            update_input();
-            rumble_frame_reset();
-            clear_gamepak_stickybits();
-            execute_arm(execute_cycles);
+            if (gba_runtime_lock_take(pdMS_TO_TICKS(8))) {
+                uint32_t frame_before = frame_counter;
 
-            if ((s_backup_poll_deadline != 0U) && gba_tick_reached(now_tick, s_backup_poll_deadline)) {
-                uint32_t observed_checksum = gba_backup_checksum32();
-                if (observed_checksum != s_backup_observed_checksum) {
-                    s_backup_observed_checksum = observed_checksum;
-                    s_backup_flush_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_FLUSH_MS);
-                }
-                s_backup_poll_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_POLL_MS);
-            }
+                update_input();
+                rumble_frame_reset();
+                clear_gamepak_stickybits();
+                execute_arm(execute_cycles);
 
-            if ((s_backup_flush_deadline != 0U) && gba_tick_reached(now_tick, s_backup_flush_deadline)) {
-                esp_err_t save_flush_err = gba_flush_backup_to_sd_card(false);
-                if (save_flush_err == ESP_OK) {
-                    s_backup_flush_deadline = 0;
-                } else {
-                    if ((save_flush_err != ESP_ERR_TIMEOUT) && (save_flush_err != ESP_ERR_NOT_FOUND)) {
-                        ESP_LOGW(TAG, "Failed to flush SD save backup: %s", esp_err_to_name(save_flush_err));
+                if ((s_backup_poll_deadline != 0U) && gba_tick_reached(now_tick, s_backup_poll_deadline)) {
+                    uint32_t observed_checksum = gba_backup_checksum32();
+                    if (observed_checksum != s_backup_observed_checksum) {
+                        s_backup_observed_checksum = observed_checksum;
+                        s_backup_flush_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_FLUSH_MS);
                     }
-                    s_backup_flush_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_FLUSH_MS);
+                    s_backup_poll_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_POLL_MS);
                 }
-            }
 
-            bool frame_advanced = (frame_counter != frame_before);
-            if (frame_advanced) {
-                s_last_frame_counter = frame_counter;
+                if ((s_backup_flush_deadline != 0U) && gba_tick_reached(now_tick, s_backup_flush_deadline)) {
+                    esp_err_t save_flush_err = gba_flush_backup_to_sd_card(false);
+                    if (save_flush_err == ESP_OK) {
+                        s_backup_flush_deadline = 0;
+                    } else {
+                        if ((save_flush_err != ESP_ERR_TIMEOUT) && (save_flush_err != ESP_ERR_NOT_FOUND)) {
+                            ESP_LOGW(TAG, "Failed to flush SD save backup: %s", esp_err_to_name(save_flush_err));
+                        }
+                        s_backup_flush_deadline = now_tick + pdMS_TO_TICKS(GBA_SD_SAVE_FLUSH_MS);
+                    }
+                }
+
+                bool frame_advanced = (frame_counter != frame_before);
+                if (frame_advanced) {
+                    s_last_frame_counter = frame_counter;
+                    has_frame = gba_copy_frame_to_canvas();
+                }
+
+                gba_runtime_lock_give();
             }
 
             if (lvgl_port_lock(20)) {
                 bool should_invalidate = false;
-                bool has_frame = false;
-                if (frame_advanced) {
-                    has_frame = gba_copy_frame_to_canvas();
-                    should_invalidate = has_frame;
-                }
+                should_invalidate = has_frame;
 
                 if (has_frame && !s_gba_frame_ready) {
                     s_gba_frame_ready = true;
@@ -4586,6 +4668,11 @@ void app_main(void)
     s_gp_pressed_mask = 0;
     s_emu_task_started = false;
     s_gp_core_initialized = false;
+
+    if (s_gba_runtime_lock == NULL) {
+        s_gba_runtime_lock = xSemaphoreCreateMutex();
+        ESP_ERROR_CHECK(s_gba_runtime_lock ? ESP_OK : ESP_ERR_NO_MEM);
+    }
 
     if (lvgl_port_lock(0)) {
         create_gba_ui();
